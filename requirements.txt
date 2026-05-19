@@ -3,3 +3,6 @@ uvicorn[standard]>=0.30
 httpx>=0.28.1
 redis[asyncio]>=5.0
 python-dotenv>=1.0
+
+# Optional: Firebase Firestore (use instead of Redis)
+# google-cloud-firestore>=2.0
