@@ -48,7 +48,8 @@ logger = logging.getLogger("tsn-mempool")
 # ── Config ───────────────────────────────────────────────────────────────────
 GITHUB_REPO     = "bigdreamsweb3/tsn-epoch-records"
 GITHUB_API      = "https://api.github.com"
-MEMPOOL_STORE   = os.environ.get("MEMPOOL_STORE", "firebase").strip().lower()
+MEMPOOL_STORE   = os.environ.get("MEMPOOL_STORE", "file").strip().lower()
+MEMPOOL_FILE    = Path(os.environ.get("MEMPOOL_FILE", ".mempool-store.json")).resolve()
 FIREBASE_COLLECTION = os.environ.get("FIREBASE_COLLECTION", "tsn_mempool").strip()
 SOLANA_RPC_URL  = os.environ.get("SOLANA_RPC_URL") or os.environ.get("RPC_URL") or "https://api.devnet.solana.com"
 TSN_PROGRAM_ID  = os.environ.get("TSN_PROGRAM_ID") or os.environ.get("PROGRAM_ID") or "TSN31jddtsmUg4D5aEdhY31nwB1e53VJJg9X8NoRP8V"
@@ -266,14 +267,85 @@ class FirebaseStore:
     async def aclose(self) -> None:
         return None
 
+class FileStore:
+    """Local JSON-backed mempool store for devnet testing without Firebase quota."""
+
+    def __init__(self, path: Path = MEMPOOL_FILE):
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    async def _read(self) -> dict:
+        if not self.path.exists():
+            return {"values": {}, "hashes": {}}
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("Local mempool file was invalid JSON; starting fresh: %s", self.path)
+            return {"values": {}, "hashes": {}}
+
+    async def _write(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    async def get(self, key: str) -> Optional[str]:
+        async with self._lock:
+            data = await self._read()
+            return data.get("values", {}).get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        async with self._lock:
+            data = await self._read()
+            data.setdefault("values", {})[key] = value
+            await self._write(data)
+
+    async def hget(self, key: str, field: str) -> Optional[str]:
+        async with self._lock:
+            data = await self._read()
+            return data.get("hashes", {}).get(key, {}).get(field)
+
+    async def hgetall(self, key: str) -> dict:
+        async with self._lock:
+            data = await self._read()
+            return dict(data.get("hashes", {}).get(key, {}))
+
+    async def hlen(self, key: str) -> int:
+        return len(await self.hgetall(key))
+
+    async def hset(self, key: str, field: Optional[str] = None, value: Optional[str] = None, mapping: Optional[dict] = None) -> None:
+        async with self._lock:
+            data = await self._read()
+            bucket = data.setdefault("hashes", {}).setdefault(key, {})
+            if mapping:
+                bucket.update(mapping)
+            elif field is not None and value is not None:
+                bucket[field] = value
+            else:
+                raise ValueError("hset requires either field/value or mapping")
+            await self._write(data)
+
+    async def delete(self, *keys: str) -> None:
+        async with self._lock:
+            data = await self._read()
+            for key in keys:
+                data.get("values", {}).pop(key, None)
+                data.get("hashes", {}).pop(key, None)
+            await self._write(data)
+
+    async def aclose(self) -> None:
+        return None
+
 _store: Optional[Any] = None
 
 async def get_store() -> Any:
     global _store
     if _store is None:
-        if MEMPOOL_STORE != "firebase":
-            raise RuntimeError("TSN mempool storage is Firebase-only. Set MEMPOOL_STORE=firebase or remove MEMPOOL_STORE.")
-        _store = FirebaseStore()
+        if MEMPOOL_STORE == "firebase":
+            _store = FirebaseStore()
+        elif MEMPOOL_STORE in {"file", "local", "json"}:
+            _store = FileStore()
+            logger.info("Using local TSN mempool store: %s", MEMPOOL_FILE)
+        else:
+            raise RuntimeError("Set MEMPOOL_STORE to file or firebase.")
     return _store
 
 async def get_mempool_store() -> Any:
@@ -479,13 +551,28 @@ class CreateIntentRequest(BaseModel):
     tokenMintAddress: str           = Field(..., description="SPL token mint address")
     amount:           float         = Field(..., description="Payment amount")
     recipientAmount:  Optional[float] = Field(None, description="Amount paid to recipient; amount minus this is protocol fee")
-    underlyingPayment: Optional[str] = Field(None)
+    underlyingPayment: Optional[str] = Field(None, description="Protocol payment reference for the authorization")
+    senderWallet: Optional[str] = Field(None, description="Wallet that signed the TSN payment authorization")
+    senderAuthorizationMessage: Optional[str] = Field(None, description="Canonical TSN payment authorization message")
+    senderAuthorizationSignature: Optional[str] = Field(None, description="Wallet signature over the authorization message")
+    senderAuthorizationNonce: Optional[str] = Field(None, description="Unique authorization nonce")
+    senderAuthorizationIssuedAt: Optional[str] = Field(None, description="Authorization issue timestamp")
+    senderAuthorizationExpiresAt: Optional[str] = Field(None, description="Authorization expiry timestamp")
+    senderFeeAmount: Optional[float] = Field(None, description="Sender-side protocol fee routed to treasury")
+    senderSignedSettlementTransaction: Optional[str] = Field(None, description="Sender co-signed settlement transaction for cranker sponsorship")
+    senderSignedSettlementFeePayer: Optional[str] = Field(None, description="Cranker fee payer expected to complete and broadcast the settlement")
+    senderSettlementMode: Optional[str] = Field(None, description="Settlement authority model")
+    senderTokenAccount: Optional[str] = Field(None, description="Sender token account used by the sponsored settlement")
+    settlementVault: Optional[str] = Field(None, description="Per-payment vault PDA")
+    settlementTokenAccount: Optional[str] = Field(None, description="Per-payment vault token account")
+    settlementPaymentIntentId: Optional[str] = Field(None, description="u64 payment intent id used by the TSN vault instruction")
     source:            Optional[str] = Field(None)
 
 class MempoolIntent(CreateIntentRequest):
     id:                   str
     status:               str           = "pending"
     assignedCrankerPubkey: Optional[str] = None
+    escrowTxSig:          Optional[str] = None
     claimTxSig:           Optional[str] = None
     proofTxSig:           Optional[str] = None
     settlementResolution: Optional[str] = None
@@ -519,9 +606,13 @@ class WorkItem(BaseModel):
     intent:       MempoolIntent
     claimRequest: MempoolClaimRequest
 
+class IntentWorkItem(BaseModel):
+    intent: MempoolIntent
+
 class UpdateStatusRequest(BaseModel):
     status:               str           = Field(...)
     assignedCrankerPubkey: Optional[str] = Field(None)
+    escrowTxSig:          Optional[str] = Field(None)
     claimTxSig:           Optional[str] = Field(None)
     proofTxSig:           Optional[str] = Field(None)
     settlementResolution: Optional[str] = Field(None)
@@ -859,6 +950,8 @@ async def update_intent_status(
     data.update({"status": body.status, "updatedAt": datetime.now(timezone.utc).isoformat()})
     if body.assignedCrankerPubkey is not None:
         data["assignedCrankerPubkey"] = body.assignedCrankerPubkey
+    if body.escrowTxSig is not None:
+        data["escrowTxSig"] = body.escrowTxSig
     if body.claimTxSig is not None:
         data["claimTxSig"] = body.claimTxSig
     if body.proofTxSig is not None:
@@ -879,7 +972,7 @@ async def post_claim_request(req: PostClaimRequest) -> MempoolClaimRequest:
     if not intent_raw:
         raise HTTPException(409, f"Intent {req.intentId} must exist before a claim request can be posted")
     intent = json.loads(intent_raw)
-    if intent.get("status") not in ("pending", "claimed", "processing"):
+    if intent.get("status") not in ("pending", "escrowed", "onchain", "claimed", "processing"):
         raise HTTPException(409, f"Intent {req.intentId} is not claimable")
     for c in await hget_all_json(k_claims()):
         if c["intentId"] == req.intentId and c["status"] not in ("failed", "canceled"):
@@ -929,8 +1022,9 @@ async def post_proof(proof: ProofOfPayment) -> ProofOfPayment:
     raw = await r.hget(k_intents(), proof.intent_id)
     if raw:
         data = json.loads(raw)
-        if data.get("status") == "claimed":
+        if data.get("status") in ("escrowed", "onchain", "claimed"):
             data["status"]    = "executed"
+            data["proofTxSig"] = proof.proof_tx
             data["updatedAt"] = datetime.now(timezone.utc).isoformat()
             await r.hset(k_intents(), proof.intent_id, json.dumps(data))
     logger.info("Proof posted: intent=%s cranker=%s", proof.intent_id, proof.cranker_pubkey)
@@ -947,11 +1041,26 @@ async def list_proofs(
     return sorted(items, key=lambda p: p.timestamp)
 
 # ── Work queue ────────────────────────────────────────────────────────────────
+@app.get("/intent-work", response_model=list[IntentWorkItem])
+async def list_pending_intent_work(
+    limit: int = Query(50, ge=1, le=500)
+) -> list[IntentWorkItem]:
+    """Pending payment-intent submissions for crankers to create on chain."""
+    intents = sorted(
+        [
+            MempoolIntent(**intent)
+            for intent in await hget_all_json(k_intents())
+            if intent.get("status") == "pending"
+        ],
+        key=lambda intent: intent.postedAt,
+    )[:limit]
+    return [IntentWorkItem(intent=intent) for intent in intents]
+
 @app.get("/work", response_model=list[WorkItem])
 async def list_pending_work(
     limit: int = Query(50, ge=1, le=500)
 ) -> list[WorkItem]:
-    """Pending work items (intent + claim pairs) for crankers to pick up."""
+    """Claim execution work. Intents must already be escrowed by a cranker-sponsored transaction."""
     intents = await hget_all_json(k_intents())
     claims  = await hget_all_json(k_claims())
     intent_map = {i["id"]: i for i in intents}
@@ -962,7 +1071,7 @@ async def list_pending_work(
     result = []
     for c in pending:
         intent = intent_map.get(c["intentId"])
-        if intent and intent["status"] == "pending":
+        if intent and intent["status"] in ("escrowed", "onchain", "claimed"):
             result.append(WorkItem(
                 intent=MempoolIntent(**intent),
                 claimRequest=MempoolClaimRequest(**c),
