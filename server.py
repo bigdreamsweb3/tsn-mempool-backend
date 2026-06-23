@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import struct
 import time
@@ -62,7 +63,6 @@ GITHUB_API      = "https://api.github.com"
 MEMPOOL_STORE   = os.environ.get("MEMPOOL_STORE", "file").strip().lower()
 MEMPOOL_FILE    = Path(os.environ.get("MEMPOOL_FILE", ".mempool-store.json")).resolve()
 FIREBASE_COLLECTION = os.environ.get("FIREBASE_COLLECTION", "tsn_mempool").strip()
-SOLANA_RPC_URL  = os.environ.get("SOLANA_RPC_URL") or os.environ.get("RPC_URL") or "https://api.devnet.solana.com"
 TSN_PROGRAM_ID  = os.environ.get("TSN_PROGRAM_ID") or os.environ.get("PROGRAM_ID") or "TSN31jddtsmUg4D5aEdhY31nwB1e53VJJg9X8NoRP8V"
 MEMPOOL_API_KEY  = os.environ.get("MEMPOOL_API_KEY", "").strip()
 TSN_ROUTE_ENCRYPTION_SECRET_KEY = (
@@ -89,6 +89,19 @@ _vault_liquidity_cache: Optional[dict[str, Any]] = None
 _vault_liquidity_lock = asyncio.Lock()
 _claim_queue_lock = asyncio.Lock()
 _recovery_queue_lock = asyncio.Lock()
+_tin_operation_lock = asyncio.Lock()
+
+
+def split_rpc_url_list(value: str) -> list[str]:
+    return [entry.strip().rstrip("/") for entry in re.split(r"[,\s]+", value) if entry.strip()]
+
+
+def resolve_solana_rpc_url() -> str:
+    urls = split_rpc_url_list(os.environ.get("TSN_SOLANA_RPC_URLS", ""))
+    return urls[0] if urls else "https://api.devnet.solana.com"
+
+
+TSN_SOLANA_RPC_URL = resolve_solana_rpc_url()
 
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
@@ -667,6 +680,9 @@ def k_proofs()  -> str: return f"{MEMPOOL_NS}:proofs"
 def k_recoveries() -> str: return f"{MEMPOOL_NS}:recoveries"
 def k_epoch()   -> str: return f"{MEMPOOL_NS}:epoch"
 def k_crankers() -> str: return f"{MEMPOOL_NS}:crankers"
+def k_tin_operations() -> str: return f"{MEMPOOL_NS}:tin_operations"
+def k_tin_fees() -> str: return f"{MEMPOOL_NS}:tin_operation_fees"
+def k_tin_registry_shadow() -> str: return f"{MEMPOOL_NS}:tin_registry_shadow"
 
 
 async def hget_all_json(key: str) -> list:
@@ -734,7 +750,7 @@ async def get_token_account_balance_ui(token_account: str) -> tuple[float, int]:
         "params": [token_account],
     }
     async with httpx.AsyncClient(timeout=12) as client:
-        response = await client.post(SOLANA_RPC_URL, json=payload)
+        response = await client.post(TSN_SOLANA_RPC_URL, json=payload)
     response.raise_for_status()
     value = response.json().get("result", {}).get("value", {})
     return float(value.get("uiAmountString") or value.get("uiAmount") or 0), int(value.get("decimals") or 0)
@@ -751,7 +767,7 @@ async def read_private_replay_sequences() -> tuple[int, int]:
     }
     try:
         async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.post(SOLANA_RPC_URL, json=payload)
+            response = await client.post(TSN_SOLANA_RPC_URL, json=payload)
         response.raise_for_status()
         rpc_response = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -800,7 +816,7 @@ async def get_program_accounts(account_size: int) -> list[dict[str, Any]]:
         ],
     }
     async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(SOLANA_RPC_URL, json=payload)
+        response = await client.post(TSN_SOLANA_RPC_URL, json=payload)
     response.raise_for_status()
     return response.json().get("result") or []
 
@@ -1041,6 +1057,123 @@ class PublicRecoveryWorkItem(BaseModel):
     postedAt: str
     updatedAt: str
 
+TIN_OPERATION_STATUSES = {
+    "pending_verification",
+    "verifier_assigned",
+    "verified",
+    "fee_pending",
+    "fee_committed",
+    "submitter_assigned",
+    "submitted_onchain",
+    "finalized",
+    "rejected",
+    "expired",
+    "failed",
+}
+TIN_OPERATION_TERMINAL_STATUSES = {"finalized", "rejected", "expired", "failed"}
+TIN_CREATION_FEE_BASE_UNITS = 50_000
+TIN_UPDATE_FEE_BASE_UNITS = 10_000
+TIN_DEFAULT_FEE_MINT = DEVNET_USDC_MINT
+TIN_FEE_SPLIT_BPS = {
+    "verifier": 3_000,
+    "submitter": 4_000,
+    "treasury": 2_000,
+    "bonus_pool": 1_000,
+}
+
+class TinOperationFeeRecord(BaseModel):
+    intentId: str
+    feeMint: str
+    grossAmount: str
+    verifierAmount: str
+    submitterAmount: str
+    treasuryAmount: str
+    bonusPoolAmount: str
+    verifierPubkey: Optional[str] = None
+    submitterPubkey: Optional[str] = None
+    treasuryPubkey: Optional[str] = None
+    bonusPoolPubkey: Optional[str] = None
+    feeCommitmentTx: Optional[str] = None
+    feeCommitmentHash: str
+    status: Literal["pending", "committed", "distributed", "failed"] = "pending"
+    createdAt: str
+    updatedAt: str
+
+class TinOperationRecord(BaseModel):
+    intentId: str
+    intentType: Literal["tin_creation", "tin_update"]
+    tin: str
+    ownerPubkey: str
+    ownerSignature: str
+    ownerIntentHash: str
+    nonce: str
+    expiry: int
+    createdAt: str
+    updatedAt: str
+    status: Literal[
+        "pending_verification",
+        "verifier_assigned",
+        "verified",
+        "fee_pending",
+        "fee_committed",
+        "submitter_assigned",
+        "submitted_onchain",
+        "finalized",
+        "rejected",
+        "expired",
+        "failed",
+    ]
+    verifierCranker: Optional[str] = None
+    submitterCranker: Optional[str] = None
+    feeMetadata: Optional[dict[str, Any]] = None
+    failureReason: Optional[str] = None
+    onchainSignatures: list[str] = Field(default_factory=list)
+    displayName: Optional[str] = None
+    encryptedPhone: Optional[str] = None
+    privacyLevel: int
+    encryptedMetadataHash: str
+    pruConfigurationHash: str
+    creationFeeAmount: Optional[str] = None
+    creationFeeMint: Optional[str] = None
+    newDisplayName: Optional[str] = None
+    newEncryptedPhone: Optional[str] = None
+    newPrivacyLevel: Optional[int] = None
+    newEncryptedMetadataHash: Optional[str] = None
+    newPruConfigurationHash: Optional[str] = None
+    updateFeeAmount: Optional[str] = None
+    updateFeeMint: Optional[str] = None
+
+class PublicTinOperationRecord(BaseModel):
+    intentId: str
+    intentType: str
+    tin: str
+    ownerPubkey: str
+    ownerIntentHash: str
+    nonce: str
+    expiry: int
+    createdAt: str
+    updatedAt: str
+    status: str
+    verifierCranker: Optional[str] = None
+    submitterCranker: Optional[str] = None
+    feeMetadata: Optional[dict[str, Any]] = None
+    failureReason: Optional[str] = None
+    onchainSignatures: list[str] = Field(default_factory=list)
+    displayName: Optional[str] = None
+    privacyLevel: int
+    encryptedMetadataHash: str
+    pruConfigurationHash: str
+
+class TinOperationStageRequest(BaseModel):
+    crankerPubkey: Optional[str] = None
+    verifierCranker: Optional[str] = None
+    submitterCranker: Optional[str] = None
+    feeCommitmentTx: Optional[str] = None
+    txSignature: Optional[str] = None
+    onchainSignature: Optional[str] = None
+    failureReason: Optional[str] = None
+    reason: Optional[str] = None
+
 class RecoveryLeaseRequest(BaseModel):
     operatorPubkey: str = Field(...)
 
@@ -1196,6 +1329,294 @@ def intent_submission_work(intent: MempoolIntent) -> MempoolIntent:
             "ephemeralPublicKeyBase64": "",
         }
     return MempoolIntent(**data)
+
+def _field(data: dict[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        if name in data and data[name] is not None:
+            return data[name]
+    return default
+
+def _require_string(data: dict[str, Any], *names: str) -> str:
+    value = _field(data, *names)
+    if value is None or str(value).strip() == "":
+        raise HTTPException(422, f"{names[0]} is required")
+    return str(value).strip()
+
+def _decode_hash32(value: Any, label: str) -> bytes:
+    text = str(value or "").strip()
+    if len(text) != 64:
+        raise HTTPException(422, f"{label} must be a 32-byte hex value")
+    try:
+        decoded = bytes.fromhex(text)
+    except ValueError as exc:
+        raise HTTPException(422, f"{label} must be a 32-byte hex value") from exc
+    if len(decoded) != 32:
+        raise HTTPException(422, f"{label} must be a 32-byte hex value")
+    return decoded
+
+def _decode_base64_blob(value: Any, label: str) -> bytes:
+    try:
+        decoded = base64.b64decode(str(value or ""), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(422, f"{label} must be base64") from exc
+    if not decoded:
+        raise HTTPException(422, f"{label} must not be empty")
+    return decoded
+
+def _decode_owner_pubkey(value: str) -> bytes:
+    try:
+        owner_bytes = decode_base58(value)
+    except ValueError as exc:
+        raise HTTPException(422, "owner_pubkey is not valid base58") from exc
+    if len(owner_bytes) != 32:
+        raise HTTPException(422, "owner_pubkey must decode to 32 bytes")
+    try:
+        Pubkey.from_string(value)
+    except ValueError as exc:
+        raise HTTPException(422, "owner_pubkey is not a valid Solana pubkey") from exc
+    return owner_bytes
+
+def _expiry_from_input(value: Any) -> int:
+    try:
+        expiry = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "expiry must be a unix timestamp in seconds") from exc
+    if expiry <= int(time.time()):
+        raise HTTPException(409, "TIN operation intent is expired")
+    return expiry
+
+def _normalize_tin_operation_input(payload: dict[str, Any]) -> dict[str, Any]:
+    intent_type = _require_string(payload, "intent_type", "intentType")
+    if intent_type not in {"tin_creation", "tin_update"}:
+        raise HTTPException(422, "intent_type must be tin_creation or tin_update")
+
+    privacy_level = int(_field(payload, "privacy_level", "privacyLevel", default=0))
+    if privacy_level not in {1, 2, 3, 4}:
+        raise HTTPException(422, "privacy_level must be between 1 and 4")
+
+    intent_id = str(_field(payload, "intent_id", "intentId", default=str(uuid4()))).strip()
+    if not intent_id:
+        raise HTTPException(422, "intent_id must not be empty")
+
+    encrypted_phone = _field(payload, "encrypted_phone", "encryptedPhone")
+    if encrypted_phone is None:
+        encrypted_phone = _field(payload, "new_encrypted_phone", "newEncryptedPhone")
+    encrypted_phone = str(encrypted_phone or "").strip()
+    encrypted_phone_bytes = _decode_base64_blob(encrypted_phone, "encrypted_phone")
+
+    encrypted_metadata_hash = _require_string(
+        payload,
+        "encrypted_metadata_hash",
+        "encryptedMetadataHash",
+        "new_encrypted_metadata_hash",
+        "newEncryptedMetadataHash",
+    )
+    pru_configuration_hash = _require_string(
+        payload,
+        "pru_configuration_hash",
+        "pruConfigurationHash",
+        "new_pru_configuration_hash",
+        "newPruConfigurationHash",
+    )
+    owner_intent_hash = _require_string(payload, "owner_intent_hash", "ownerIntentHash")
+    nonce = _require_string(payload, "nonce")
+    owner_pubkey = _require_string(payload, "owner_pubkey", "ownerPubkey")
+    owner_signature = _require_string(payload, "owner_signature", "ownerSignature")
+    display_name = str(_field(payload, "display_name", "displayName", "new_display_name", "newDisplayName", default="")).strip()
+    if not display_name:
+        raise HTTPException(422, "display_name is required")
+
+    owner_bytes = _decode_owner_pubkey(owner_pubkey)
+    metadata_hash_bytes = _decode_hash32(encrypted_metadata_hash, "encrypted_metadata_hash")
+    configuration_hash_bytes = _decode_hash32(pru_configuration_hash, "pru_configuration_hash")
+    intent_hash_bytes = _decode_hash32(owner_intent_hash, "owner_intent_hash")
+    nonce_bytes = _decode_hash32(nonce, "nonce")
+    signature_bytes = _decode_base64_blob(owner_signature, "owner_signature")
+    if len(signature_bytes) != 64:
+        raise HTTPException(422, "owner_signature must be a 64-byte Ed25519 signature")
+    expiry = _expiry_from_input(_field(payload, "expiry", "expiry_ts", "expiryTs"))
+
+    expected_hash = hashlib.sha256(
+        b"".join(
+            [
+                f"TINS_{'CREATE' if intent_type == 'tin_creation' else 'UPDATE'}_INTENT_V1".encode(),
+                owner_bytes,
+                display_name.encode("utf-8"),
+                encrypted_phone_bytes,
+                bytes([privacy_level]),
+                metadata_hash_bytes,
+                configuration_hash_bytes,
+                nonce_bytes,
+                int(expiry).to_bytes(8, "little", signed=True),
+            ]
+        )
+    ).digest()
+    if not secrets.compare_digest(expected_hash, intent_hash_bytes):
+        raise HTTPException(422, "owner_intent_hash does not match the submitted TIN operation payload")
+    try:
+        VerifyKey(owner_bytes).verify(intent_hash_bytes, signature_bytes)
+    except BadSignatureError as exc:
+        raise HTTPException(401, "owner_signature is invalid for owner_intent_hash") from exc
+
+    fee_amount = _field(
+        payload,
+        "creation_fee_amount" if intent_type == "tin_creation" else "update_fee_amount",
+        "creationFeeAmount" if intent_type == "tin_creation" else "updateFeeAmount",
+        default=str(TIN_CREATION_FEE_BASE_UNITS if intent_type == "tin_creation" else TIN_UPDATE_FEE_BASE_UNITS),
+    )
+    fee_mint = str(
+        _field(
+            payload,
+            "creation_fee_mint" if intent_type == "tin_creation" else "update_fee_mint",
+            "creationFeeMint" if intent_type == "tin_creation" else "updateFeeMint",
+            default=TIN_DEFAULT_FEE_MINT,
+        )
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    base: dict[str, Any] = {
+        "intentId": intent_id,
+        "intentType": intent_type,
+        "tin": _require_string(payload, "tin"),
+        "ownerPubkey": owner_pubkey,
+        "ownerSignature": owner_signature,
+        "ownerIntentHash": owner_intent_hash.lower(),
+        "nonce": nonce.lower(),
+        "expiry": expiry,
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+        "status": "pending_verification",
+        "verifierCranker": None,
+        "submitterCranker": None,
+        "feeMetadata": None,
+        "failureReason": None,
+        "onchainSignatures": [],
+        "displayName": display_name if intent_type == "tin_creation" else None,
+        "encryptedPhone": encrypted_phone if intent_type == "tin_creation" else None,
+        "privacyLevel": privacy_level,
+        "encryptedMetadataHash": encrypted_metadata_hash.lower(),
+        "pruConfigurationHash": pru_configuration_hash.lower(),
+        "creationFeeAmount": str(fee_amount) if intent_type == "tin_creation" else None,
+        "creationFeeMint": fee_mint if intent_type == "tin_creation" else None,
+        "newDisplayName": display_name if intent_type == "tin_update" else None,
+        "newEncryptedPhone": encrypted_phone if intent_type == "tin_update" else None,
+        "newPrivacyLevel": privacy_level if intent_type == "tin_update" else None,
+        "newEncryptedMetadataHash": encrypted_metadata_hash.lower() if intent_type == "tin_update" else None,
+        "newPruConfigurationHash": pru_configuration_hash.lower() if intent_type == "tin_update" else None,
+        "updateFeeAmount": str(fee_amount) if intent_type == "tin_update" else None,
+        "updateFeeMint": fee_mint if intent_type == "tin_update" else None,
+    }
+    return base
+
+def public_tin_operation(record: TinOperationRecord | dict[str, Any]) -> PublicTinOperationRecord:
+    data = record.model_dump() if isinstance(record, TinOperationRecord) else dict(record)
+    data.pop("encryptedPhone", None)
+    data.pop("newEncryptedPhone", None)
+    data.pop("ownerSignature", None)
+    return PublicTinOperationRecord(**data)
+
+def _fee_amount_base_units(operation: dict[str, Any]) -> int:
+    raw = (
+        operation.get("creationFeeAmount")
+        if operation.get("intentType") == "tin_creation"
+        else operation.get("updateFeeAmount")
+    )
+    if raw is None or str(raw).strip() == "":
+        return TIN_CREATION_FEE_BASE_UNITS if operation.get("intentType") == "tin_creation" else TIN_UPDATE_FEE_BASE_UNITS
+    value = Decimal(str(raw))
+    if value <= 0:
+        raise HTTPException(422, "TIN operation fee amount must be positive")
+    if value < 1:
+        value = value * Decimal(1_000_000)
+    if value != value.to_integral_value():
+        raise HTTPException(422, "TIN operation fee must resolve to whole USDC base units")
+    return int(value)
+
+def compute_tin_fee_split(gross_amount: int) -> dict[str, int]:
+    verifier = gross_amount * TIN_FEE_SPLIT_BPS["verifier"] // 10_000
+    submitter = gross_amount * TIN_FEE_SPLIT_BPS["submitter"] // 10_000
+    treasury = gross_amount * TIN_FEE_SPLIT_BPS["treasury"] // 10_000
+    bonus_pool = gross_amount - verifier - submitter - treasury
+    return {
+        "verifier": verifier,
+        "submitter": submitter,
+        "treasury": treasury,
+        "bonus_pool": bonus_pool,
+    }
+
+def compute_tin_fee_commitment_hash(operation: dict[str, Any], fee_record: dict[str, Any]) -> str:
+    canonical = {
+        "domain": "TSN_TIN_FEE_COMMITMENT_V1",
+        "intentId": operation["intentId"],
+        "intentType": operation["intentType"],
+        "tin": operation["tin"],
+        "ownerPubkey": operation["ownerPubkey"],
+        "ownerIntentHash": operation["ownerIntentHash"],
+        "feeMint": fee_record["feeMint"],
+        "grossAmount": fee_record["grossAmount"],
+        "verifierAmount": fee_record["verifierAmount"],
+        "submitterAmount": fee_record["submitterAmount"],
+        "treasuryAmount": fee_record["treasuryAmount"],
+        "bonusPoolAmount": fee_record["bonusPoolAmount"],
+        "verifierPubkey": fee_record.get("verifierPubkey"),
+        "submitterPubkey": fee_record.get("submitterPubkey"),
+        "treasuryPubkey": fee_record.get("treasuryPubkey"),
+        "bonusPoolPubkey": fee_record.get("bonusPoolPubkey"),
+    }
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+def append_unique_signature(signatures: Any, tx_sig: str) -> list[str]:
+    ordered = [str(signature) for signature in (signatures or []) if signature]
+    if tx_sig not in ordered:
+        ordered.append(tx_sig)
+    return ordered
+
+async def read_shadow_tin_owner(tin: str) -> Optional[str]:
+    r = await get_mempool_store()
+    raw = await r.hget(k_tin_registry_shadow(), tin)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+        return str(value.get("ownerPubkey") or "") or None
+    except json.JSONDecodeError:
+        return None
+
+async def write_shadow_tin_owner(operation: dict[str, Any]) -> None:
+    r = await get_mempool_store()
+    await r.hset(
+        k_tin_registry_shadow(),
+        str(operation["tin"]),
+        json.dumps(
+            {
+                "tin": operation["tin"],
+                "ownerPubkey": operation["ownerPubkey"],
+                "intentId": operation["intentId"],
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        ),
+    )
+
+async def assert_tin_operation_can_enter(operation: dict[str, Any]) -> None:
+    existing_owner = await read_shadow_tin_owner(str(operation["tin"]))
+    if operation["intentType"] == "tin_creation" and existing_owner:
+        raise HTTPException(409, "TIN already exists in mempool registry shadow")
+    if operation["intentType"] == "tin_update":
+        if not existing_owner:
+            raise HTTPException(409, "TIN does not exist in mempool registry shadow")
+        if existing_owner != operation["ownerPubkey"]:
+            raise HTTPException(409, "owner_pubkey does not match stored TIN owner")
+
+    for existing in await hget_all_json(k_tin_operations()):
+        if existing.get("intentId") == operation["intentId"]:
+            continue
+        if existing.get("ownerPubkey") == operation["ownerPubkey"] and existing.get("nonce") == operation["nonce"]:
+            raise HTTPException(409, "nonce has already been used by this owner_pubkey")
+        if (
+            operation["intentType"] == "tin_creation"
+            and existing.get("tin") == operation["tin"]
+            and existing.get("status") not in TIN_OPERATION_TERMINAL_STATUSES
+        ):
+            raise HTTPException(409, "TIN already has an active creation intent")
 
 def recovery_priority(
     item: dict[str, Any],
@@ -1618,6 +2039,282 @@ async def mempool_status(request: MempoolStatusRequest) -> MempoolStatusResponse
     )
 
 # ── Intents ───────────────────────────────────────────────────────────────────
+async def expire_stale_tin_operations() -> None:
+    r = await get_mempool_store()
+    now_ts = int(time.time())
+    for raw in await hget_all_json(k_tin_operations()):
+        if raw.get("status") in TIN_OPERATION_TERMINAL_STATUSES:
+            continue
+        if int(raw.get("expiry") or 0) > now_ts:
+            continue
+        raw["status"] = "expired"
+        raw["failureReason"] = "Owner authorization expired before finalization."
+        raw["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        await r.hset(k_tin_operations(), str(raw["intentId"]), json.dumps(raw))
+
+@app.post("/tin-operations", response_model=PublicTinOperationRecord)
+async def post_tin_operation(payload: dict[str, Any]) -> PublicTinOperationRecord:
+    """Queue a TIN creation/update intent. The mempool never mutates TINS directly."""
+    operation = _normalize_tin_operation_input(payload)
+    async with _tin_operation_lock:
+        r = await get_mempool_store()
+        existing = await r.hget(k_tin_operations(), operation["intentId"])
+        if existing:
+            return public_tin_operation(json.loads(existing))
+        await assert_tin_operation_can_enter(operation)
+        await r.hset(k_tin_operations(), operation["intentId"], json.dumps(operation))
+    logger.info("TIN operation queued: %s type=%s tin=%s", operation["intentId"], operation["intentType"], operation["tin"])
+    return public_tin_operation(operation)
+
+@app.get("/tin-operations", response_model=list[PublicTinOperationRecord])
+async def list_tin_operations(
+    status: Optional[str] = Query(None),
+    intent_type: Optional[str] = Query(None),
+) -> list[PublicTinOperationRecord]:
+    await expire_stale_tin_operations()
+    items = await hget_all_json(k_tin_operations())
+    if status:
+        items = [item for item in items if item.get("status") == status]
+    if intent_type:
+        items = [item for item in items if item.get("intentType") == intent_type or item.get("intent_type") == intent_type]
+    return [
+        public_tin_operation(item)
+        for item in sorted(items, key=lambda item: str(item.get("createdAt") or ""))
+    ]
+
+@app.get(
+    "/tin-operations/verification-work",
+    response_model=list[TinOperationRecord],
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def list_tin_verification_work(limit: int = Query(50, ge=1, le=500)) -> list[TinOperationRecord]:
+    await expire_stale_tin_operations()
+    items = [
+        TinOperationRecord(**item)
+        for item in await hget_all_json(k_tin_operations())
+        if item.get("status") in {"pending_verification", "verifier_assigned"}
+    ]
+    return sorted(items, key=lambda item: item.createdAt)[:limit]
+
+@app.get(
+    "/tin-operations/fee-work",
+    response_model=list[TinOperationRecord],
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def list_tin_fee_work(
+    operator_pubkey: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[TinOperationRecord]:
+    await expire_stale_tin_operations()
+    allow_single = os.environ.get("TSN_ALLOW_SINGLE_CRANKER_TINS") == "1"
+    items = []
+    for item in await hget_all_json(k_tin_operations()):
+        if item.get("status") not in {"verified", "fee_pending"}:
+            continue
+        if operator_pubkey and item.get("verifierCranker") == operator_pubkey and not allow_single:
+            continue
+        items.append(TinOperationRecord(**item))
+    return sorted(items, key=lambda item: item.createdAt)[:limit]
+
+@app.get(
+    "/tin-operations/registry-work",
+    response_model=list[TinOperationRecord],
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def list_tin_registry_work(
+    operator_pubkey: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[TinOperationRecord]:
+    await expire_stale_tin_operations()
+    items = []
+    for item in await hget_all_json(k_tin_operations()):
+        if item.get("status") not in {"fee_committed", "submitter_assigned"}:
+            continue
+        if operator_pubkey and item.get("submitterCranker") and item.get("submitterCranker") != operator_pubkey:
+            continue
+        items.append(TinOperationRecord(**item))
+    return sorted(items, key=lambda item: item.updatedAt)[:limit]
+
+@app.get("/tin-operations/{intent_id}", response_model=PublicTinOperationRecord)
+async def get_tin_operation(intent_id: str = ApiPath(...)) -> PublicTinOperationRecord:
+    await expire_stale_tin_operations()
+    r = await get_mempool_store()
+    raw = await r.hget(k_tin_operations(), intent_id)
+    if not raw:
+        raise HTTPException(404, f"TIN operation {intent_id} not found")
+    return public_tin_operation(json.loads(raw))
+
+async def patch_tin_operation(intent_id: str, patch: dict[str, Any], allowed_statuses: set[str]) -> TinOperationRecord:
+    r = await get_mempool_store()
+    raw = await r.hget(k_tin_operations(), intent_id)
+    if not raw:
+        raise HTTPException(404, f"TIN operation {intent_id} not found")
+    data = json.loads(raw)
+    if data.get("status") not in allowed_statuses:
+        raise HTTPException(409, f"TIN operation is {data.get('status')}, not ready for this transition")
+    data.update(patch)
+    data["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    await r.hset(k_tin_operations(), intent_id, json.dumps(data))
+    return TinOperationRecord(**data)
+
+@app.post(
+    "/tin-operations/{intent_id}/verified",
+    response_model=TinOperationRecord,
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def mark_tin_operation_verified(
+    intent_id: str = ApiPath(...),
+    body: TinOperationStageRequest = ...,
+) -> TinOperationRecord:
+    cranker = body.verifierCranker or body.crankerPubkey
+    if not cranker:
+        raise HTTPException(422, "verifier cranker pubkey is required")
+    return await patch_tin_operation(
+        intent_id,
+        {"status": "verified", "verifierCranker": cranker, "failureReason": None},
+        {"pending_verification", "verifier_assigned"},
+    )
+
+@app.post(
+    "/tin-operations/{intent_id}/fee-committed",
+    response_model=TinOperationRecord,
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def mark_tin_operation_fee_committed(
+    intent_id: str = ApiPath(...),
+    body: TinOperationStageRequest = ...,
+) -> TinOperationRecord:
+    submitter = body.submitterCranker or body.crankerPubkey
+    if not submitter:
+        raise HTTPException(422, "submitter cranker pubkey is required for fee commitment")
+    async with _tin_operation_lock:
+        r = await get_mempool_store()
+        raw = await r.hget(k_tin_operations(), intent_id)
+        if not raw:
+            raise HTTPException(404, f"TIN operation {intent_id} not found")
+        operation = json.loads(raw)
+        if operation.get("status") not in {"verified", "fee_pending"}:
+            raise HTTPException(409, "TIN operation must be verified before fee commitment")
+        verifier = operation.get("verifierCranker")
+        if verifier == submitter and os.environ.get("TSN_ALLOW_SINGLE_CRANKER_TINS") != "1":
+            raise HTTPException(409, "submitter cranker must differ from verifier cranker")
+        gross = _fee_amount_base_units(operation)
+        split = compute_tin_fee_split(gross)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        fee_mint = operation.get("creationFeeMint") if operation.get("intentType") == "tin_creation" else operation.get("updateFeeMint")
+        fee_record = {
+            "intentId": intent_id,
+            "feeMint": fee_mint or TIN_DEFAULT_FEE_MINT,
+            "grossAmount": str(gross),
+            "verifierAmount": str(split["verifier"]),
+            "submitterAmount": str(split["submitter"]),
+            "treasuryAmount": str(split["treasury"]),
+            "bonusPoolAmount": str(split["bonus_pool"]),
+            "verifierPubkey": verifier,
+            "submitterPubkey": submitter,
+            "treasuryPubkey": os.environ.get("TSN_TINS_TREASURY_PUBKEY"),
+            "bonusPoolPubkey": os.environ.get("TSN_TINS_BONUS_POOL_PUBKEY"),
+            "feeCommitmentTx": body.feeCommitmentTx,
+            "feeCommitmentHash": "",
+            "status": "committed",
+            "createdAt": now_iso,
+            "updatedAt": now_iso,
+        }
+        fee_record["feeCommitmentHash"] = compute_tin_fee_commitment_hash(operation, fee_record)
+        fee = TinOperationFeeRecord(**fee_record)
+        operation.update(
+            {
+                "status": "fee_committed",
+                "submitterCranker": submitter,
+                "feeMetadata": fee.model_dump(),
+                "updatedAt": now_iso,
+            }
+        )
+        await r.hset(k_tin_fees(), intent_id, json.dumps(fee.model_dump()))
+        await r.hset(k_tin_operations(), intent_id, json.dumps(operation))
+        return TinOperationRecord(**operation)
+
+@app.post(
+    "/tin-operations/{intent_id}/submitted",
+    response_model=TinOperationRecord,
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def mark_tin_operation_submitted(
+    intent_id: str = ApiPath(...),
+    body: TinOperationStageRequest = ...,
+) -> TinOperationRecord:
+    submitter = body.submitterCranker or body.crankerPubkey
+    tx_sig = body.txSignature or body.onchainSignature
+    if not submitter:
+        raise HTTPException(422, "submitter cranker pubkey is required")
+    if not tx_sig:
+        raise HTTPException(422, "on-chain transaction signature is required")
+    r = await get_mempool_store()
+    raw = await r.hget(k_tin_operations(), intent_id)
+    if not raw:
+        raise HTTPException(404, f"TIN operation {intent_id} not found")
+    current = json.loads(raw)
+    if current.get("submitterCranker") and current.get("submitterCranker") != submitter:
+        raise HTTPException(409, "registry work is assigned to a different submitter cranker")
+    return await patch_tin_operation(
+        intent_id,
+        {
+            "status": "submitted_onchain",
+            "submitterCranker": submitter,
+            "onchainSignatures": append_unique_signature(current.get("onchainSignatures"), tx_sig),
+        },
+        {"fee_committed", "submitter_assigned"},
+    )
+
+@app.post(
+    "/tin-operations/{intent_id}/finalized",
+    response_model=TinOperationRecord,
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def mark_tin_operation_finalized(
+    intent_id: str = ApiPath(...),
+    body: TinOperationStageRequest = ...,
+) -> TinOperationRecord:
+    patch: dict[str, Any] = {"status": "finalized"}
+    tx_sig = body.txSignature or body.onchainSignature
+    r = await get_mempool_store()
+    raw = await r.hget(k_tin_operations(), intent_id)
+    if raw and tx_sig:
+        patch["onchainSignatures"] = append_unique_signature(json.loads(raw).get("onchainSignatures"), tx_sig)
+    finalized = await patch_tin_operation(intent_id, patch, {"submitted_onchain"})
+    await write_shadow_tin_owner(finalized.model_dump())
+    return finalized
+
+@app.post(
+    "/tin-operations/{intent_id}/failed",
+    response_model=TinOperationRecord,
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def mark_tin_operation_failed(
+    intent_id: str = ApiPath(...),
+    body: TinOperationStageRequest = ...,
+) -> TinOperationRecord:
+    return await patch_tin_operation(
+        intent_id,
+        {"status": "failed", "failureReason": body.failureReason or body.reason or "TIN operation failed."},
+        TIN_OPERATION_STATUSES - {"finalized"},
+    )
+
+@app.post(
+    "/tin-operations/{intent_id}/rejected",
+    response_model=TinOperationRecord,
+    dependencies=[Depends(require_worker_api_key)],
+)
+async def mark_tin_operation_rejected(
+    intent_id: str = ApiPath(...),
+    body: TinOperationStageRequest = ...,
+) -> TinOperationRecord:
+    return await patch_tin_operation(
+        intent_id,
+        {"status": "rejected", "failureReason": body.failureReason or body.reason or "TIN operation rejected."},
+        TIN_OPERATION_STATUSES - {"finalized"},
+    )
+
 @app.post("/intents", response_model=PublicMempoolIntent)
 async def post_intent(req: CreateIntentRequest) -> PublicMempoolIntent:
     """Submit a payment intent. Idempotent by paymentId."""

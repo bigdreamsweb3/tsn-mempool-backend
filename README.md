@@ -28,7 +28,7 @@ Copy `.env.example` to `.env` and configure:
 - `FIREBASE_PRIVATE_KEY` - Firebase Admin private key, with newlines encoded as `\n`
 - `FIREBASE_COLLECTION` - Firestore root collection, default `tsn_mempool`
 - `TSN_PROGRAM_ID` - TSN escrow program id scanned for `CrankerVault` accounts
-- `SOLANA_RPC_URL` - Solana RPC endpoint used for on-chain vault discovery and SPL token balances
+- `TSN_SOLANA_RPC_URLS` - Shared RPC gateway URL list used for on-chain vault discovery and SPL token balances
 - `EPOCH_HOURS` - epoch duration, default `7`
 
 Redis and local JSON file storage are not used. Firebase Firestore is the mempool source of truth for live intents, claim requests, proofs, and epoch state.
